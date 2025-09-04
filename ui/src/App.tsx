@@ -1,11 +1,16 @@
 import { ConnectButton, useCurrentAccount } from "@mysten/dapp-kit";
+import { isValidSuiObjectId } from "@mysten/sui/utils";
 import { Box, Container, Flex, Heading } from "@radix-ui/themes";
-import { Greeting } from "./Greeting";
-import { useNetworkVariable } from "./networkConfig";
+import { useState } from "react";
+import { Greeting } from './Greeting';
+import { CreateGreeting } from "./CreateGreeting";
 
 function App() {
   const currentAccount = useCurrentAccount();
-  const greetingId = useNetworkVariable("greetingObjectId");
+  const [greetingId, setGreeting] = useState(() => {
+    const hash = window.location.hash.slice(1);
+    return isValidSuiObjectId(hash) ? hash : null;
+  });
 
   return (
     <>
@@ -19,7 +24,7 @@ function App() {
         }}
       >
         <Box>
-          <Heading>Hello World Template</Heading>
+          <Heading>dApp Starter Template</Heading>
         </Box>
 
         <Box>
@@ -29,12 +34,21 @@ function App() {
       <Container>
         <Container
           mt="5"
-          py="2"
+          pt="2"
           px="4"
-          style={{ background: "var(--gray-a2)" }}
+          style={{ background: "var(--gray-a2)", minHeight: 500 }}
         >
           {currentAccount ? (
-            <Greeting id={greetingId} />
+            greetingId ? (
+              <Greeting id={greetingId} />
+            ) : (
+              <CreateGreeting
+                onCreated={(id) => {
+                  window.location.hash = id;
+                  setGreeting(id);
+                }}
+              />
+            )
           ) : (
             <Heading>Please connect your wallet</Heading>
           )}

@@ -3,7 +3,7 @@
 
 /// This example demonstrates a basic use of a shared greeting.
 /// Rules:
-/// - one global Greeting object is created at module publication
+/// - anyone can create and share a Greeting object
 /// - everyone can update the text of the Greeting object
 module hello_world::greeting {
   use std::string;
@@ -13,10 +13,9 @@ module hello_world::greeting {
     id: UID,
     text: string::String,
   }
-
-  /// Called automatically once when this module is published. 
-  /// Creates a globally shared Greeting object initialized with "Hello world!"
-  fun init(ctx: &mut TxContext) { 
+ 
+  /// API call that creates a globally shared Greeting object initialized with "Hello world!"
+  public fun new(ctx: &mut TxContext) { 
     let new_greeting = Greeting { 
       id: object::new(ctx),
       text: b"Hello world!".to_string()

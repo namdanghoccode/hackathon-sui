@@ -11,7 +11,7 @@ import { useState } from "react";
 import ClipLoader from "react-spinners/ClipLoader";
 
 export function Greeting({ id }: { id: string }) {
-  const counterPackageId = useNetworkVariable("helloWorldPackageId");
+  const helloWorldPackageId = useNetworkVariable("helloWorldPackageId");
   const suiClient = useSuiClient();
   const { mutate: signAndExecute } = useSignAndExecuteTransaction();
   const { data, isPending, error, refetch } = useSuiClientQuery("getObject", {
@@ -26,14 +26,12 @@ export function Greeting({ id }: { id: string }) {
 
   const executeMoveCall = () => {
 
-    console.log(`New Text: ${newText}`);
-
     setWaitingForTxn(true);
 
     const tx = new Transaction();
 
     tx.moveCall({
-      target: `${counterPackageId}::greeting::update_text`,
+      target: `${helloWorldPackageId}::greeting::update_text`,
       arguments: [tx.object(id), tx.pure.string(newText)]
     });
 
