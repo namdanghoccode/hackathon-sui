@@ -7,28 +7,79 @@ import type { SuiObjectData } from "@mysten/sui/client";
 import { Transaction } from "@mysten/sui/transactions";
 import { Box, Button, Container, Flex, Heading, Text, TextField } from "@radix-ui/themes";
 import { useNetworkVariable } from "./networkConfig";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Gift, ArrowLeft, Sparkles } from "lucide-react";
+import { ArrowLeft, Sparkles, Clock, AlertTriangle, RotateCcw, Mail, CheckCircle, Shield } from "lucide-react";
 import ClipLoader from "react-spinners/ClipLoader";
 import confetti from "canvas-confetti";
+import { useZkLogin, verifyEmailHash, hashEmailForContract } from "./hooks/useZkLogin";
+import { useNotification } from "./contexts/NotificationContext";
 
 interface ClaimGiftProps {
   onBack: () => void;
+  initialGiftId?: string; // Allow passing gift ID from notification
 }
 
-export function ClaimGift({ onBack }: ClaimGiftProps) {
+// Helper functions (moved outside component to avoid hoisting issues)
+const getGiftFieldsHelper = (data: SuiObjectData) => {
+  if (data.content?.dataType !== "moveObject") {
+    return null;
+  }
+  return data.content.fields as {
+    sender: string;
+    message: string;
+    is_opened?: boolean;
+    is_claimed?: boolean;
+    content: { fields: { balance: string } };
+    gas_deposit?: { fields: { balance: string } };
+    expires_at?: string;
+    created_at?: string;
+    recipient_email_hash?: number[];
+  };
+};
+
+const isSharedGiftHelper = (objData: SuiObjectData): boolean => {
+  if (objData.content?.dataType !== "moveObject") return false;
+  const type = objData.content.type || "";
+  return type.includes("SharedGiftBox");
+};
+
+export function ClaimGift({ onBack, initialGiftId }: ClaimGiftProps) {
   const packageId = useNetworkVariable("helloWorldPackageId");
   const suiClient = useSuiClient();
   const { mutate: signAndExecute } = useSignAndExecuteTransaction();
+  
+  // Notification context
+  const { addNotification } = useNotification();
+  
+  // zkLogin state - lấy từ session đăng nhập ở trang chính
+  const { 
+    isLoggedIn: zkLoggedIn, 
+    userEmail: zkUserEmail,
+    userAddress: zkUserAddress,
+  } = useZkLogin();
+  
+  const [emailVerified, setEmailVerified] = useState(false);
+  const [verificationStatus, setVerificationStatus] = useState<'none' | 'checking' | 'verified' | 'failed'>('none');
 
-  const [giftId, setGiftId] = useState("");
-  const [searchedGiftId, setSearchedGiftId] = useState("");
+  const [giftId, setGiftId] = useState(initialGiftId || "");
+  const [searchedGiftId, setSearchedGiftId] = useState(initialGiftId || "");
   const [waitingForTxn, setWaitingForTxn] = useState(false);
+  const [isRejecting, setIsRejecting] = useState(false);
   const [isOpened, setIsOpened] = useState(false);
   const [error, setError] = useState("");
+  const [timeRemaining, setTimeRemaining] = useState<string | null>(null);
+  const [isExpired, setIsExpired] = useState(false);
 
-  const { data, isPending, error: queryError, refetch } = useSuiClientQuery(
+  // Auto search if initialGiftId is provided
+  useEffect(() => {
+    if (initialGiftId) {
+      setGiftId(initialGiftId);
+      setSearchedGiftId(initialGiftId);
+    }
+  }, [initialGiftId]);
+
+  const { data, isPending, error: queryError } = useSuiClientQuery(
     "getObject",
     {
       id: searchedGiftId,
@@ -41,6 +92,125 @@ export function ClaimGift({ onBack }: ClaimGiftProps) {
       enabled: searchedGiftId.length > 0,
     }
   );
+
+  // Calculate time remaining
+  useEffect(() => {
+    if (!data?.data) return;
+    
+    const giftData = getGiftFieldsHelper(data.data);
+    if (!giftData || !giftData.expires_at || giftData.expires_at === "0") {
+      setTimeRemaining(null);
+      setIsExpired(false);
+      return;
+    }
+
+    const checkExpiry = () => {
+      const expiresAt = parseInt(giftData.expires_at || "0");
+      const now = Date.now();
+      
+      if (now > expiresAt) {
+        setIsExpired(true);
+        setTimeRemaining("Đã hết hạn");
+        return;
+      }
+
+      setIsExpired(false);
+      const remaining = expiresAt - now;
+      const days = Math.floor(remaining / (1000 * 60 * 60 * 24));
+      const hours = Math.floor((remaining % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+      const minutes = Math.floor((remaining % (1000 * 60 * 60)) / (1000 * 60));
+      
+      if (days > 0) {
+        setTimeRemaining(`${days} ngày ${hours} giờ`);
+      } else if (hours > 0) {
+        setTimeRemaining(`${hours} giờ ${minutes} phút`);
+      } else {
+        setTimeRemaining(`${minutes} phút`);
+      }
+    };
+
+    checkExpiry();
+    const interval = setInterval(checkExpiry, 60000); // Update every minute
+    return () => clearInterval(interval);
+  }, [data]);
+
+  // Verify zkLogin email matches gift recipient
+  useEffect(() => {
+    const verifyEmail = async () => {
+      console.log('=== EMAIL VERIFICATION START ===');
+      console.log('data?.data:', !!data?.data);
+      console.log('zkLoggedIn:', zkLoggedIn);
+      console.log('zkUserEmail:', zkUserEmail);
+      
+      if (!data?.data || !zkLoggedIn || !zkUserEmail) {
+        console.log('Missing data - setting not verified');
+        setEmailVerified(false);
+        setVerificationStatus('none');
+        return;
+      }
+
+      // Check if this is a SharedGiftBox
+      const isSharedGiftBox = isSharedGiftHelper(data.data);
+      console.log('isSharedGiftBox:', isSharedGiftBox);
+      
+      const giftData = getGiftFieldsHelper(data.data);
+      console.log('giftData:', giftData);
+      console.log('recipient_email_hash:', giftData?.recipient_email_hash);
+      
+      if (!giftData || !giftData.recipient_email_hash || giftData.recipient_email_hash.length === 0) {
+        // No email hash stored - this is a standard gift, auto verify
+        console.log('No email hash - auto verify');
+        setEmailVerified(true);
+        setVerificationStatus('verified');
+        return;
+      }
+
+      // For SharedGiftBox: Trust zkLogin authentication, contract will verify
+      // User just needs to be logged in with zkLogin
+      if (isSharedGiftBox) {
+        console.log('SharedGiftBox detected - auto verify, contract will check hash');
+        setEmailVerified(true); // Allow attempt, contract will verify hash
+        setVerificationStatus('verified');
+        setError(''); // Clear any previous error
+        return;
+      }
+
+      setVerificationStatus('checking');
+      
+      try {
+        // Get the stored email hash from the gift
+        const storedHash = giftData.recipient_email_hash;
+        
+        // Debug log
+        console.log('User email:', zkUserEmail);
+        console.log('Stored hash:', storedHash);
+        
+        // Verify the zkLogin user's email matches
+        const isVerified = await verifyEmailHash(zkUserEmail, storedHash);
+        
+        console.log('Email verified:', isVerified);
+        
+        // Compute hash for debugging
+        const computedHash = await hashEmailForContract(zkUserEmail);
+        console.log('Computed hash:', computedHash);
+        
+        setEmailVerified(isVerified);
+        setVerificationStatus(isVerified ? 'verified' : 'failed');
+        
+        if (!isVerified) {
+          setError(`Email không khớp! Gift này được gửi cho email khác.`);
+        } else {
+          setError('');
+        }
+      } catch (err) {
+        console.error('Email verification error:', err);
+        setEmailVerified(false);
+        setVerificationStatus('failed');
+      }
+    };
+
+    verifyEmail();
+  }, [data, zkLoggedIn, zkUserEmail]);
 
   // Trigger confetti animation
   const triggerConfetti = () => {
@@ -83,18 +253,68 @@ export function ClaimGift({ onBack }: ClaimGiftProps) {
     setSearchedGiftId(giftId);
   };
 
-  const handleOpenGift = () => {
+  const handleOpenGift = async () => {
     if (!searchedGiftId) return;
+    if (isExpired) {
+      setError("Quà đã hết hạn! Không thể nhận được nữa.");
+      return;
+    }
 
     setWaitingForTxn(true);
     setError("");
 
     const tx = new Transaction();
 
-    tx.moveCall({
-      target: `${packageId}::gifting::open_and_claim`,
-      arguments: [tx.object(searchedGiftId)],
-    });
+    // Kiểm tra loại quà và gọi function phù hợp
+    if (isShared) {
+      // SharedGiftBox - cần email hash để claim
+      if (!zkLoggedIn || !zkUserEmail) {
+        setError("Vui lòng đăng nhập bằng Google để nhận quà!");
+        setWaitingForTxn(false);
+        return;
+      }
+      
+      // Hash email của người dùng hiện tại
+      const myEmailHash = await hashEmailForContract(zkUserEmail);
+      
+      // Debug: Log để so sánh hash
+      console.log('=== CLAIM DEBUG ===');
+      console.log('Claiming with email:', zkUserEmail);
+      console.log('My email hash:', myEmailHash);
+      console.log('Stored email hash in gift:', giftData?.recipient_email_hash);
+      
+      // So sánh hash
+      const storedHash = giftData?.recipient_email_hash;
+      if (storedHash) {
+        const hashMatch = myEmailHash.length === storedHash.length && 
+          myEmailHash.every((byte: number, i: number) => byte === storedHash[i]);
+        console.log('Hash match:', hashMatch);
+        
+        if (!hashMatch) {
+          setError(`Email không khớp! Gift này được gửi cho email khác, không phải ${zkUserEmail}`);
+          setWaitingForTxn(false);
+          return;
+        }
+      }
+      
+      tx.moveCall({
+        target: `${packageId}::gifting::claim_shared_gift`,
+        arguments: [
+          tx.object(searchedGiftId),
+          tx.pure('vector<u8>', myEmailHash),
+          tx.object("0x6"), // Sui Clock object
+        ],
+      });
+    } else {
+      // GiftBox thường - chỉ chủ sở hữu mới claim được
+      tx.moveCall({
+        target: `${packageId}::gifting::open_and_claim`,
+        arguments: [
+          tx.object(searchedGiftId),
+          tx.object("0x6"), // Sui Clock object
+        ],
+      });
+    }
 
     signAndExecute(
       {
@@ -108,35 +328,169 @@ export function ClaimGift({ onBack }: ClaimGiftProps) {
               setIsOpened(true);
               triggerConfetti();
               setWaitingForTxn(false);
+              
+              // Thêm thông báo nhận quà thành công
+              const amountSui = giftData?.content?.fields?.balance 
+                ? (parseInt(giftData.content.fields.balance) / 1_000_000_000).toFixed(4)
+                : "0";
+              addNotification({
+                giftId: searchedGiftId,
+                senderAddress: giftData?.sender || "Unknown",
+                amount: amountSui,
+                message: giftData?.message || "",
+                type: 'claim_success',
+              });
             })
             .catch((err) => {
               console.error(err);
               setError("Không thể mở quà. Vui lòng thử lại!");
               setWaitingForTxn(false);
+              
+              // Thêm thông báo thất bại
+              addNotification({
+                giftId: searchedGiftId,
+                senderAddress: giftData?.sender || "Unknown",
+                amount: "0",
+                message: "Lỗi khi xử lý giao dịch",
+                type: 'claim_failed',
+              });
             });
         },
         onError: (err) => {
           console.error(err);
-          setError("Có lỗi xảy ra. Bạn có phải là người nhận không?");
+          let errorMessage = "Có lỗi xảy ra";
+          
+          if (err.message?.includes("EGiftExpired") || err.message?.includes("expired")) {
+            setError("Quà đã hết hạn!");
+            errorMessage = "Quà đã hết hạn";
+            setIsExpired(true);
+          } else if (err.message?.includes("EEmailHashMismatch") || err.message?.includes("mismatch")) {
+            setError("Email không khớp! Quà này được gửi cho email khác.");
+            errorMessage = "Email không khớp";
+          } else if (err.message?.includes("EGiftAlreadyClaimed") || err.message?.includes("claimed")) {
+            setError("Quà này đã được nhận rồi!");
+            errorMessage = "Quà đã được nhận";
+          } else if (err.message?.includes("No valid gas coins")) {
+            setError("Không đủ SUI để trả phí giao dịch!");
+            errorMessage = "Không đủ SUI trả phí gas";
+          } else if (isShared) {
+            setError("Có lỗi xảy ra. Email của bạn có thể không khớp với email người nhận.");
+            errorMessage = "Email không khớp hoặc lỗi khác";
+          } else {
+            setError("Có lỗi xảy ra. Bạn có phải là người nhận không?");
+            errorMessage = "Không phải người nhận";
+          }
+          
+          // Thêm thông báo thất bại
+          addNotification({
+            giftId: searchedGiftId,
+            senderAddress: giftData?.sender || "Unknown",
+            amount: "0",
+            message: errorMessage,
+            type: 'claim_failed',
+          });
+          
           setWaitingForTxn(false);
         },
       }
     );
   };
 
-  const getGiftFields = (data: SuiObjectData) => {
-    if (data.content?.dataType !== "moveObject") {
-      return null;
+  // Reject gift - return to sender (chỉ dành cho GiftBox thường, không phải SharedGiftBox)
+  const handleRejectGift = () => {
+    if (!searchedGiftId) return;
+    
+    // SharedGiftBox không thể reject - chỉ có thể claim hoặc đợi hết hạn để refund
+    if (isShared) {
+      setError("Quà gửi qua email không thể từ chối. Người gửi có thể lấy lại khi quà hết hạn.");
+      return;
     }
-    return data.content.fields as {
-      sender: string;
-      message: string;
-      is_opened: boolean;
-      content: { fields: { balance: string } };
-    };
+
+    setIsRejecting(true);
+    setError("");
+
+    const tx = new Transaction();
+
+    tx.moveCall({
+      target: `${packageId}::gifting::reject_gift`,
+      arguments: [tx.object(searchedGiftId)],
+    });
+
+    signAndExecute(
+      { transaction: tx },
+      {
+        onSuccess: (result) => {
+          suiClient
+            .waitForTransaction({ digest: result.digest })
+            .then(() => {
+              setSearchedGiftId("");
+              setGiftId("");
+              setIsRejecting(false);
+              alert("Đã từ chối quà và hoàn tiền cho người gửi!");
+            })
+            .catch((err) => {
+              console.error(err);
+              setError("Không thể từ chối quà. Vui lòng thử lại!");
+              setIsRejecting(false);
+            });
+        },
+        onError: (err) => {
+          console.error(err);
+          setError("Có lỗi xảy ra khi từ chối quà.");
+          setIsRejecting(false);
+        },
+      }
+    );
   };
 
-  const giftData = data?.data ? getGiftFields(data.data) : null;
+  // Refund expired gift
+  const handleRefundExpired = () => {
+    if (!searchedGiftId || !isExpired) return;
+
+    setWaitingForTxn(true);
+    setError("");
+
+    const tx = new Transaction();
+
+    tx.moveCall({
+      target: `${packageId}::gifting::refund_expired_gift`,
+      arguments: [
+        tx.object(searchedGiftId),
+        tx.object("0x6"), // Sui Clock object
+      ],
+    });
+
+    signAndExecute(
+      { transaction: tx },
+      {
+        onSuccess: (result) => {
+          suiClient
+            .waitForTransaction({ digest: result.digest })
+            .then(() => {
+              setSearchedGiftId("");
+              setGiftId("");
+              setWaitingForTxn(false);
+              alert("Đã hoàn tiền quà hết hạn về cho người gửi!");
+            })
+            .catch((err) => {
+              console.error(err);
+              setError("Không thể hoàn tiền. Vui lòng thử lại!");
+              setWaitingForTxn(false);
+            });
+        },
+        onError: (err) => {
+          console.error(err);
+          setError("Có lỗi xảy ra khi hoàn tiền.");
+          setWaitingForTxn(false);
+        },
+      }
+    );
+  };
+
+  // Use the helper functions
+  const giftData = data?.data ? getGiftFieldsHelper(data.data) : null;
+  const isShared = data?.data ? isSharedGiftHelper(data.data) : false;
+  const hasZkLoginRequirement = giftData?.recipient_email_hash && giftData.recipient_email_hash.length > 0;
   const suiAmount = giftData?.content?.fields?.balance
     ? (parseInt(giftData.content.fields.balance) / 1_000_000_000).toFixed(4)
     : "0";
@@ -244,6 +598,38 @@ export function ClaimGift({ onBack }: ClaimGiftProps) {
                 }}
               >
                 <Flex direction="column" gap="4">
+                  {/* Hiển thị trạng thái đăng nhập từ trang chính */}
+                  {zkLoggedIn ? (
+                    <Box
+                      p="3"
+                      style={{
+                        background: "linear-gradient(135deg, rgba(52, 168, 83, 0.1) 0%, rgba(66, 133, 244, 0.1) 100%)",
+                        borderRadius: "12px",
+                        border: "1px solid rgba(52, 168, 83, 0.3)",
+                      }}
+                    >
+                      <Flex align="center" gap="2">
+                        <CheckCircle size={18} color="#34a853" />
+                        <Text size="2" style={{ color: "#34a853", fontWeight: 600 }}>
+                          Đăng nhập: {zkUserEmail}
+                        </Text>
+                      </Flex>
+                    </Box>
+                  ) : (
+                    <Box
+                      p="3"
+                      style={{
+                        background: "rgba(255, 193, 7, 0.1)",
+                        borderRadius: "12px",
+                        border: "1px solid rgba(255, 193, 7, 0.3)",
+                      }}
+                    >
+                      <Text size="2" style={{ color: "#b45309" }}>
+                        💡 Để nhận quà qua email, hãy đăng nhập Google ở góc phải trên màn hình chính
+                      </Text>
+                    </Box>
+                  )}
+
                   <Box>
                     <Text as="label" size="3" weight="bold" mb="2" style={{ display: "block", color: "#ff6b35" }}>
                       🎁 Gift ID
@@ -347,6 +733,38 @@ export function ClaimGift({ onBack }: ClaimGiftProps) {
                       <Text size="2" style={{ color: "#666", marginBottom: "0.8rem", display: "block", fontWeight: 500 }}>
                         Từ: {giftData.sender.slice(0, 6)}...{giftData.sender.slice(-4)}
                       </Text>
+                      
+                      {/* Expiry time indicator */}
+                      {timeRemaining && (
+                        <Box
+                          mb="4"
+                          p="3"
+                          style={{
+                            background: isExpired 
+                              ? "rgba(255, 50, 50, 0.1)" 
+                              : "rgba(255, 107, 53, 0.1)",
+                            borderRadius: "12px",
+                            border: isExpired 
+                              ? "1px solid rgba(255, 50, 50, 0.3)"
+                              : "1px solid rgba(255, 107, 53, 0.3)",
+                          }}
+                        >
+                          <Flex align="center" justify="center" gap="2">
+                            {isExpired ? (
+                              <AlertTriangle size={18} color="#d00" />
+                            ) : (
+                              <Clock size={18} color="#ff6b35" />
+                            )}
+                            <Text size="2" style={{ 
+                              color: isExpired ? "#d00" : "#ff6b35",
+                              fontWeight: 600 
+                            }}>
+                              {isExpired ? "Quà đã hết hạn!" : `Còn ${timeRemaining} để nhận`}
+                            </Text>
+                          </Flex>
+                        </Box>
+                      )}
+                      
                       <Box
                         p="4"
                         mb="4"
@@ -358,6 +776,23 @@ export function ClaimGift({ onBack }: ClaimGiftProps) {
                       >
                         <Text size="3" style={{ color: "#ff6b35", fontStyle: "italic", fontWeight: 600 }}>
                           "{giftData.message}"
+                        </Text>
+                      </Box>
+                      
+                      {/* Amount preview */}
+                      <Box
+                        p="4"
+                        mb="4"
+                        style={{
+                          background: "linear-gradient(135deg, rgba(255, 107, 53, 0.15) 0%, rgba(247, 147, 30, 0.15) 100%)",
+                          borderRadius: "15px",
+                        }}
+                      >
+                        <Text size="2" style={{ color: "#666", display: "block" }}>
+                          Số tiền trong quà
+                        </Text>
+                        <Text size="6" style={{ color: "#ff6b35", fontWeight: 800 }}>
+                          {suiAmount} SUI
                         </Text>
                       </Box>
                     </Box>
@@ -378,52 +813,198 @@ export function ClaimGift({ onBack }: ClaimGiftProps) {
                       </Box>
                     )}
 
-                    {/* Open Button */}
-                    <motion.div
-                      whileHover={{ scale: 1.05, y: -3 }}
-                      whileTap={{ scale: 0.95 }}
-                      style={{ width: "100%" }}
-                    >
-                      <Button
-                        size="4"
-                        onClick={handleOpenGift}
-                        disabled={waitingForTxn}
+                    {/* zkLogin Verification Section */}
+                    {hasZkLoginRequirement && (
+                      <Box
+                        p="4"
+                        mb="2"
                         style={{
-                          background: waitingForTxn 
-                            ? "#ccc"
-                            : "linear-gradient(135deg, #ff6b35 0%, #f7931e 100%)",
-                          color: "white",
-                          padding: "2rem 3rem",
-                          fontSize: "1.3rem",
-                          fontWeight: 900,
-                          borderRadius: "20px",
-                          cursor: waitingForTxn ? "not-allowed" : "pointer",
-                          border: "none",
+                          background: zkLoggedIn && emailVerified 
+                            ? "rgba(34, 197, 94, 0.1)"
+                            : !zkLoggedIn 
+                              ? "rgba(255, 193, 7, 0.1)"
+                              : "rgba(255, 107, 53, 0.08)",
+                          borderRadius: "15px",
+                          border: zkLoggedIn && emailVerified 
+                            ? "2px solid rgba(34, 197, 94, 0.3)"
+                            : !zkLoggedIn
+                              ? "2px solid rgba(255, 193, 7, 0.3)"
+                              : "2px solid rgba(255, 107, 53, 0.3)",
                           width: "100%",
-                          boxShadow: "0 20px 50px rgba(255, 107, 53, 0.5)",
-                          letterSpacing: "0.5px",
                         }}
                       >
-                        {waitingForTxn ? (
-                          <Flex align="center" justify="center" gap="2">
-                            <ClipLoader size={24} color="white" />
-                            Đang mở quà...
-                          </Flex>
+                        <Flex align="center" gap="3" mb="2">
+                          <Shield size={20} color={zkLoggedIn && emailVerified ? "#22c55e" : !zkLoggedIn ? "#b45309" : "#ff6b35"} />
+                          <Text size="3" weight="bold" style={{ 
+                            color: zkLoggedIn && emailVerified ? "#22c55e" : !zkLoggedIn ? "#b45309" : "#ff6b35" 
+                          }}>
+                            {zkLoggedIn && emailVerified 
+                              ? "✓ Email đã xác minh" 
+                              : !zkLoggedIn
+                                ? "Cần đăng nhập Google"
+                                : "Email không khớp"}
+                          </Text>
+                        </Flex>
+                        
+                        {!zkLoggedIn ? (
+                          <Text size="2" style={{ color: "#666" }}>
+                            Quà này yêu cầu xác minh email. Vui lòng đăng nhập Google ở góc phải trên màn hình chính trước khi nhận quà.
+                          </Text>
                         ) : (
-                          <motion.span
-                            animate={{
-                              scale: [1, 1.05, 1],
-                            }}
-                            transition={{
-                              duration: 1,
-                              repeat: Infinity,
+                          <Flex align="center" gap="2">
+                            <Mail size={16} color="#666" />
+                            <Text size="2" style={{ color: "#666" }}>
+                              {zkUserEmail}
+                            </Text>
+                            {verificationStatus === 'checking' && (
+                              <ClipLoader size={14} color="#ff6b35" />
+                            )}
+                            {verificationStatus === 'verified' && (
+                              <CheckCircle size={16} color="#22c55e" />
+                            )}
+                            {verificationStatus === 'failed' && (
+                              <AlertTriangle size={16} color="#dc2626" />
+                            )}
+                          </Flex>
+                        )}
+                      </Box>
+                    )}
+
+                    {/* Action Buttons */}
+                    {isExpired ? (
+                      // Expired: Show refund button
+                      <motion.div
+                        whileHover={{ scale: 1.02, y: -2 }}
+                        whileTap={{ scale: 0.98 }}
+                        style={{ width: "100%" }}
+                      >
+                        <Button
+                          size="4"
+                          onClick={handleRefundExpired}
+                          disabled={waitingForTxn}
+                          style={{
+                            background: waitingForTxn 
+                              ? "#ccc"
+                              : "linear-gradient(135deg, #666 0%, #888 100%)",
+                            color: "white",
+                            padding: "1.5rem 2rem",
+                            fontSize: "1.1rem",
+                            fontWeight: 800,
+                            borderRadius: "18px",
+                            cursor: waitingForTxn ? "not-allowed" : "pointer",
+                            border: "none",
+                            width: "100%",
+                            boxShadow: "0 10px 30px rgba(0, 0, 0, 0.2)",
+                          }}
+                        >
+                          {waitingForTxn ? (
+                            <Flex align="center" justify="center" gap="2">
+                              <ClipLoader size={22} color="white" />
+                              Đang xử lý...
+                            </Flex>
+                          ) : (
+                            <Flex align="center" justify="center" gap="2">
+                              <RotateCcw size={22} />
+                              Hoàn tiền về người gửi
+                            </Flex>
+                          )}
+                        </Button>
+                      </motion.div>
+                    ) : (
+                      // Not expired: Show claim and reject buttons
+                      <Flex gap="3" style={{ width: "100%" }}>
+                        {/* Reject Button - Chỉ hiển thị cho GiftBox thường, không phải SharedGiftBox */}
+                        {!isShared && (
+                          <motion.div
+                            whileHover={{ scale: 1.02 }}
+                            whileTap={{ scale: 0.98 }}
+                            style={{ flex: 1 }}
+                          >
+                            <Button
+                              size="4"
+                              onClick={handleRejectGift}
+                              disabled={waitingForTxn || isRejecting || (hasZkLoginRequirement && !emailVerified)}
+                              style={{
+                                background: "white",
+                                color: "#666",
+                                padding: "1.5rem 1rem",
+                                fontSize: "1rem",
+                                fontWeight: 700,
+                                borderRadius: "15px",
+                                cursor: isRejecting || (hasZkLoginRequirement && !emailVerified) ? "not-allowed" : "pointer",
+                                border: "2px solid #ccc",
+                                width: "100%",
+                                opacity: (hasZkLoginRequirement && !emailVerified) ? 0.5 : 1,
+                              }}
+                            >
+                              {isRejecting ? (
+                                <ClipLoader size={20} color="#666" />
+                              ) : (
+                                "↩️ Từ chối"
+                              )}
+                            </Button>
+                          </motion.div>
+                        )}
+
+                        {/* Open Button */}
+                        <motion.div
+                          whileHover={{ scale: (hasZkLoginRequirement && !emailVerified) ? 1 : 1.05, y: (hasZkLoginRequirement && !emailVerified) ? 0 : -3 }}
+                          whileTap={{ scale: (hasZkLoginRequirement && !emailVerified) ? 1 : 0.95 }}
+                          style={{ flex: isShared ? 1 : 2 }}
+                        >
+                          <Button
+                            size="4"
+                            onClick={handleOpenGift}
+                            disabled={waitingForTxn || isRejecting || (hasZkLoginRequirement && !emailVerified)}
+                            style={{
+                              background: waitingForTxn || (hasZkLoginRequirement && !emailVerified)
+                                ? "#ccc"
+                                : "linear-gradient(135deg, #ff6b35 0%, #f7931e 100%)",
+                              color: "white",
+                              padding: "1.5rem 2rem",
+                              fontSize: "1.2rem",
+                              fontWeight: 900,
+                              borderRadius: "18px",
+                              cursor: waitingForTxn || (hasZkLoginRequirement && !emailVerified) ? "not-allowed" : "pointer",
+                              border: "none",
+                              width: "100%",
+                              boxShadow: (hasZkLoginRequirement && !emailVerified) ? "none" : "0 15px 40px rgba(255, 107, 53, 0.4)",
+                              letterSpacing: "0.5px",
                             }}
                           >
-                            🎉 MỞ QUÀ NGAY!
-                          </motion.span>
-                        )}
-                      </Button>
-                    </motion.div>
+                            {waitingForTxn ? (
+                              <Flex align="center" justify="center" gap="2">
+                                <ClipLoader size={24} color="white" />
+                                Đang mở quà...
+                              </Flex>
+                            ) : (hasZkLoginRequirement && !emailVerified) ? (
+                              <Flex align="center" justify="center" gap="2">
+                                <Shield size={22} />
+                                Cần xác minh email
+                              </Flex>
+                            ) : (
+                              <motion.span
+                                animate={{
+                                  scale: [1, 1.05, 1],
+                                }}
+                                transition={{
+                                  duration: 1,
+                                  repeat: Infinity,
+                                }}
+                              >
+                                🎉 MỞ QUÀ NGAY!
+                              </motion.span>
+                            )}
+                          </Button>
+                        </motion.div>
+                      </Flex>
+                    )}
+                    
+                    <Text size="2" style={{ color: "#999", textAlign: "center" }}>
+                      💡 {giftData.gas_deposit?.fields?.balance && parseInt(giftData.gas_deposit.fields.balance) > 0
+                        ? "Phí gas sẽ được trả từ gas deposit của người gửi"
+                        : "Bạn cần có SUI trong ví để trả phí gas"}
+                    </Text>
                   </Flex>
                 )}
               </Box>

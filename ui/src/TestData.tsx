@@ -1,4 +1,4 @@
-import { Box, Button, Container, Flex, Heading, Text } from "@radix-ui/themes";
+import { Box, Button, Flex, Heading, Text } from "@radix-ui/themes";
 import { motion } from "framer-motion";
 import { Copy, Info } from "lucide-react";
 import { useState } from "react";

@@ -4,8 +4,9 @@ import { useSignAndExecuteTransaction, useSuiClient, useCurrentAccount } from "@
 import { useNetworkVariable } from "./networkConfig";
 import { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Gift, ArrowLeft, Send, Sparkles, Package, User, MessageCircle, Wallet } from "lucide-react";
+import { Gift, ArrowLeft, Send, Sparkles, Package, User, MessageCircle, Wallet, Mail, Fuel } from "lucide-react";
 import ClipLoader from "react-spinners/ClipLoader";
+import { hashEmailForContract } from "./hooks/useZkLogin";
 
 interface CreateGiftProps {
   onBack: () => void;
@@ -19,14 +20,22 @@ export function CreateGift({ onBack, onCreated }: CreateGiftProps) {
   const { mutate: signAndExecute } = useSignAndExecuteTransaction();
 
   const [recipient, setRecipient] = useState("");
+  const [recipientEmail, setRecipientEmail] = useState("");
   const [amount, setAmount] = useState("");
+  const [gasDeposit, setGasDeposit] = useState("0.01"); // Default gas deposit for recipient
   const [message, setMessage] = useState("");
   const [waitingForTxn, setWaitingForTxn] = useState(false);
   const [error, setError] = useState("");
+  const [useZkLoginMode, setUseZkLoginMode] = useState(false); // Toggle zkLogin mode
 
-  const handleSendGift = () => {
-    if (!recipient || !amount || !message) {
+  const handleSendGift = async () => {
+    if (!amount || !message) {
       setError("Vui lòng điền đầy đủ thông tin!");
+      return;
+    }
+
+    if (!recipient && !recipientEmail) {
+      setError("Vui lòng nhập địa chỉ ví hoặc email người nhận!");
       return;
     }
 
@@ -36,73 +45,116 @@ export function CreateGift({ onBack, onCreated }: CreateGiftProps) {
       return;
     }
 
+    const gasNum = parseFloat(gasDeposit);
+    if (isNaN(gasNum) || gasNum < 0) {
+      setError("Phí gas deposit không hợp lệ!");
+      return;
+    }
+
     setError("");
     setWaitingForTxn(true);
 
-    const tx = new Transaction();
-    
-    const amountInMist = Math.floor(amountNum * 1_000_000_000);
-    const [coin] = tx.splitCoins(tx.gas, [amountInMist]);
+    try {
+      const tx = new Transaction();
+      const amountInMist = Math.floor(amountNum * 1_000_000_000);
+      const gasInMist = Math.floor(gasNum * 1_000_000_000);
+      
+      // Split coins for gift and gas deposit
+      const [giftCoin] = tx.splitCoins(tx.gas, [amountInMist]);
+      const [gasCoin] = tx.splitCoins(tx.gas, [gasInMist]);
 
-    tx.moveCall({
-      target: `${packageId}::gifting::send_sui_gift`,
-      arguments: [
-        coin,
-        tx.pure.string(message),
-        tx.pure.address(recipient),
-      ],
-    });
+      if (useZkLoginMode && recipientEmail) {
+        // zkLogin mode - GỬI QUÀ CHỈ BẰNG EMAIL
+        // Không cần biết địa chỉ ví người nhận
+        const emailHash = await hashEmailForContract(recipientEmail);
+        
+        console.log('Creating email-only gift for:', recipientEmail);
+        console.log('Email hash:', emailHash);
 
-    signAndExecute(
-      {
-        transaction: tx,
-      },
-      {
-        onSuccess: (result) => {
-          suiClient
-            .waitForTransaction({ 
-              digest: result.digest, 
-              options: { showEffects: true, showObjectChanges: true } 
-            })
-            .then((txResult) => {
-              const createdObjects = txResult.objectChanges?.filter(
-                (obj) => obj.type === "created"
-              );
-              
-              if (createdObjects && createdObjects.length > 0) {
-                const giftBoxId = (createdObjects[0] as any).objectId;
-                onCreated(giftBoxId);
-              }
-              setWaitingForTxn(false);
-            })
-            .catch((err) => {
-              console.error(err);
-              setError("Giao dịch thất bại. Vui lòng thử lại!");
-              setWaitingForTxn(false);
-            });
-        },
-        onError: (err) => {
-          console.error("Error details:", err);
-          console.error("Error message:", err.message);
-          console.error("Error stack:", err.stack);
-          
-          let errorMessage = "Có lỗi xảy ra. ";
-          
-          if (err.message && (err.message.includes("No valid gas coins") || err.message.includes("Insufficient"))) {
-            errorMessage = "❌ Ví không có SUI! Vui lòng:\n\n1️⃣ Click nút 'Lấy Testnet SUI' ở góc trên\n2️⃣ Hoặc truy cập: https://faucet.sui.io\n3️⃣ Paste địa chỉ ví và lấy SUI miễn phí";
-          } else if (err.message && err.message.includes("Invalid")) {
-            errorMessage = "Địa chỉ người nhận không hợp lệ!";
-          } else if (err.message) {
-            errorMessage += err.message;
-          } else {
-            errorMessage += "Vui lòng kiểm tra số dư và thử lại!";
-          }
-          
-          setError(errorMessage);
+        // Sử dụng function mới: send_gift_email_only
+        // Quà sẽ là shared object - ai chứng minh được email thì nhận được
+        tx.moveCall({
+          target: `${packageId}::gifting::send_gift_email_only`,
+          arguments: [
+            giftCoin,
+            gasCoin,
+            tx.pure.string(message),
+            tx.pure('vector<u8>', emailHash),
+            tx.object("0x6"), // Sui Clock object
+          ],
+        });
+      } else {
+        // Simple mode without zkLogin (legacy)
+        if (!recipient) {
+          setError("Vui lòng nhập địa chỉ ví người nhận!");
           setWaitingForTxn(false);
-        },
+          return;
+        }
+
+        tx.moveCall({
+          target: `${packageId}::gifting::send_sui_gift`,
+          arguments: [
+            giftCoin,
+            tx.pure.string(message),
+            tx.pure.address(recipient),
+          ],
+        });
+        
+        // Transfer the gas coin back since legacy doesn't need it
+        tx.transferObjects([gasCoin], tx.pure.address(currentAccount?.address || recipient));
       }
-    );
+
+      signAndExecute(
+        { transaction: tx },
+        {
+          onSuccess: (result) => {
+            suiClient
+              .waitForTransaction({ 
+                digest: result.digest, 
+                options: { showEffects: true, showObjectChanges: true } 
+              })
+              .then((txResult) => {
+                const createdObjects = txResult.objectChanges?.filter(
+                  (obj) => obj.type === "created"
+                );
+                
+                if (createdObjects && createdObjects.length > 0) {
+                  const giftBoxId = (createdObjects[0] as any).objectId;
+                  onCreated(giftBoxId);
+                }
+                setWaitingForTxn(false);
+              })
+              .catch((err) => {
+                console.error(err);
+                setError("Giao dịch thất bại. Vui lòng thử lại!");
+                setWaitingForTxn(false);
+              });
+          },
+          onError: (err) => {
+            console.error("Error details:", err);
+            
+            let errorMessage = "Có lỗi xảy ra. ";
+            
+            if (err.message && (err.message.includes("No valid gas coins") || err.message.includes("Insufficient"))) {
+              errorMessage = "❌ Ví không có SUI! Vui lòng:\n\n1️⃣ Click nút 'Lấy Testnet SUI' ở góc trên\n2️⃣ Hoặc truy cập: https://faucet.sui.io\n3️⃣ Paste địa chỉ ví và lấy SUI miễn phí";
+            } else if (err.message && err.message.includes("Invalid")) {
+              errorMessage = "Địa chỉ người nhận không hợp lệ!";
+            } else if (err.message) {
+              errorMessage += err.message;
+            } else {
+              errorMessage += "Vui lòng kiểm tra số dư và thử lại!";
+            }
+            
+            setError(errorMessage);
+            setWaitingForTxn(false);
+          },
+        }
+      );
+    } catch (err) {
+      console.error(err);
+      setError("Có lỗi xảy ra khi tạo giao dịch");
+      setWaitingForTxn(false);
+    }
   };
 
   return (
@@ -336,11 +388,103 @@ export function CreateGift({ onBack, onCreated }: CreateGiftProps) {
                 </Box>
 
                 {/* Form Fields with Modern Design */}
+                
+                {/* zkLogin Toggle */}
+                <Box
+                  style={{
+                    padding: "1rem 1.5rem",
+                    background: useZkLoginMode 
+                      ? "linear-gradient(135deg, rgba(255, 107, 53, 0.15) 0%, rgba(247, 147, 30, 0.15) 100%)"
+                      : "rgba(0,0,0,0.03)",
+                    borderRadius: "15px",
+                    border: useZkLoginMode ? "2px solid #ff6b35" : "2px solid transparent",
+                    cursor: "pointer",
+                    transition: "all 0.3s ease",
+                  }}
+                  onClick={() => setUseZkLoginMode(!useZkLoginMode)}
+                >
+                  <Flex align="center" justify="between">
+                    <Flex align="center" gap="3">
+                      <Mail size={20} color={useZkLoginMode ? "#ff6b35" : "#666"} />
+                      <Box>
+                        <Text size="3" weight="bold" style={{ color: useZkLoginMode ? "#ff6b35" : "#333" }}>
+                          Gửi qua Email (zkLogin) ✨
+                        </Text>
+                        <Text size="2" style={{ color: "#666" }}>
+                          Người nhận đăng nhập Google để nhận quà
+                        </Text>
+                      </Box>
+                    </Flex>
+                    <Box
+                      style={{
+                        width: "48px",
+                        height: "26px",
+                        background: useZkLoginMode ? "#ff6b35" : "#ccc",
+                        borderRadius: "13px",
+                        position: "relative",
+                        transition: "all 0.3s ease",
+                      }}
+                    >
+                      <motion.div
+                        animate={{ x: useZkLoginMode ? 22 : 2 }}
+                        transition={{ type: "spring", stiffness: 500, damping: 30 }}
+                        style={{
+                          position: "absolute",
+                          top: "2px",
+                          width: "22px",
+                          height: "22px",
+                          background: "white",
+                          borderRadius: "50%",
+                          boxShadow: "0 2px 4px rgba(0,0,0,0.2)",
+                        }}
+                      />
+                    </Box>
+                  </Flex>
+                </Box>
+
+                {/* Email input (shown when zkLogin enabled) */}
+                <AnimatePresence>
+                  {useZkLoginMode && (
+                    <motion.div
+                      initial={{ opacity: 0, height: 0 }}
+                      animate={{ opacity: 1, height: "auto" }}
+                      exit={{ opacity: 0, height: 0 }}
+                    >
+                      <Box>
+                        <Flex align="center" gap="2" mb="2">
+                          <Mail size={18} color="#ff6b35" />
+                          <Text size="3" weight="bold" style={{ color: "#333" }}>
+                            Email người nhận
+                          </Text>
+                        </Flex>
+                        <TextField.Root
+                          size="3"
+                          type="email"
+                          placeholder="example@gmail.com"
+                          value={recipientEmail}
+                          onChange={(e) => setRecipientEmail(e.target.value)}
+                          disabled={waitingForTxn}
+                          style={{
+                            borderRadius: "15px",
+                            border: "2px solid rgba(255, 107, 53, 0.2)",
+                            fontSize: "1rem",
+                            padding: "0.7rem",
+                            background: "rgba(255, 255, 255, 0.95)",
+                          }}
+                        />
+                        <Text size="2" style={{ color: "#ff6b35", marginTop: "0.5rem", display: "block" }}>
+                          ✨ Chỉ người sở hữu email này mới nhận được quà
+                        </Text>
+                      </Box>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+
                 <Box>
                   <Flex align="center" gap="2" mb="2">
                     <User size={18} color="#ff6b35" />
                     <Text size="3" weight="bold" style={{ color: "#333" }}>
-                      Địa chỉ người nhận
+                      Địa chỉ ví người nhận {useZkLoginMode && "(tùy chọn)"}
                     </Text>
                   </Flex>
                   <TextField.Root
@@ -359,32 +503,67 @@ export function CreateGift({ onBack, onCreated }: CreateGiftProps) {
                   />
                 </Box>
 
-                <Box>
-                  <Flex align="center" gap="2" mb="2">
-                    <Wallet size={18} color="#ff6b35" />
-                    <Text size="3" weight="bold" style={{ color: "#333" }}>
-                      Số lượng SUI
-                    </Text>
-                  </Flex>
-                  <TextField.Root
-                    size="3"
-                    type="number"
-                    placeholder="0.1"
-                    value={amount}
-                    onChange={(e) => setAmount(e.target.value)}
-                    disabled={waitingForTxn}
-                    style={{
-                      borderRadius: "15px",
-                      border: "2px solid rgba(255, 107, 53, 0.2)",
-                      fontSize: "1rem",
-                      padding: "0.7rem",
-                      background: "rgba(255, 255, 255, 0.95)",
-                    }}
-                  />
-                  <Text size="2" style={{ color: "#999", marginTop: "0.5rem", display: "block" }}>
-                    💡 Số dư: {currentAccount ? "Kiểm tra trong ví" : "Chưa kết nối"}
-                  </Text>
-                </Box>
+                <Flex gap="4">
+                  <Box style={{ flex: 2 }}>
+                    <Flex align="center" gap="2" mb="2">
+                      <Wallet size={18} color="#ff6b35" />
+                      <Text size="3" weight="bold" style={{ color: "#333" }}>
+                        Số lượng SUI
+                      </Text>
+                    </Flex>
+                    <TextField.Root
+                      size="3"
+                      type="number"
+                      placeholder="0.1"
+                      value={amount}
+                      onChange={(e) => setAmount(e.target.value)}
+                      disabled={waitingForTxn}
+                      style={{
+                        borderRadius: "15px",
+                        border: "2px solid rgba(255, 107, 53, 0.2)",
+                        fontSize: "1rem",
+                        padding: "0.7rem",
+                        background: "rgba(255, 255, 255, 0.95)",
+                      }}
+                    />
+                  </Box>
+                  
+                  {useZkLoginMode && (
+                    <motion.div
+                      initial={{ opacity: 0, width: 0 }}
+                      animate={{ opacity: 1, width: "auto" }}
+                      style={{ flex: 1 }}
+                    >
+                      <Flex align="center" gap="2" mb="2">
+                        <Fuel size={18} color="#ff6b35" />
+                        <Text size="3" weight="bold" style={{ color: "#333" }}>
+                          Gas deposit
+                        </Text>
+                      </Flex>
+                      <TextField.Root
+                        size="3"
+                        type="number"
+                        placeholder="0.01"
+                        value={gasDeposit}
+                        onChange={(e) => setGasDeposit(e.target.value)}
+                        disabled={waitingForTxn}
+                        style={{
+                          borderRadius: "15px",
+                          border: "2px solid rgba(255, 107, 53, 0.2)",
+                          fontSize: "1rem",
+                          padding: "0.7rem",
+                          background: "rgba(255, 255, 255, 0.95)",
+                        }}
+                      />
+                    </motion.div>
+                  )}
+                </Flex>
+                
+                <Text size="2" style={{ color: "#999", marginTop: "-0.5rem", display: "block" }}>
+                  💡 {useZkLoginMode 
+                    ? "Gas deposit sẽ trả phí giao dịch cho người nhận" 
+                    : "Số dư: " + (currentAccount ? "Kiểm tra trong ví" : "Chưa kết nối")}
+                </Text>
 
                 <Box>
                   <Flex align="center" gap="2" mb="2">

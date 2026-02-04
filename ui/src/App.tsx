@@ -1,9 +1,15 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { HomePage } from "./HomePage";
 import { CreateGift } from "./CreateGift";
 import { ClaimGift } from "./ClaimGift";
 import { TestData } from "./TestData";
 import { motion, AnimatePresence } from "framer-motion";
+import { NotificationToast } from "./components/NotificationToast";
+import { GiftPopup } from "./components/GiftPopup";
+import { useNotification } from "./contexts/NotificationContext";
+import { useListenGifts } from "./hooks/useListenGifts";
+import { useCurrentAccount } from "@mysten/dapp-kit";
+import { useZkLogin, parseJwtFromUrl } from "./hooks/useZkLogin";
 
 type Page = 'home' | 'create' | 'claim' | 'success';
 
@@ -11,10 +17,79 @@ function App() {
   const [currentPage, setCurrentPage] = useState<Page>('home');
   const [createdGiftId, setCreatedGiftId] = useState<string | null>(null);
   const [showTestData, setShowTestData] = useState(false);
+  const [claimGiftId, setClaimGiftId] = useState<string | undefined>(undefined);
+  
+  const currentAccount = useCurrentAccount();
+  const { showPopup, setShowPopup, markAsRead } = useNotification();
+  
+  // zkLogin - handle OAuth callback at App level
+  const { handleOAuthCallback, isLoggedIn: zkLoggedIn, userEmail: zkUserEmail } = useZkLogin();
+  
+  // Listen for new gifts
+  useListenGifts();
+
+  // Handle OAuth callback (zkLogin) - process JWT from URL hash
+  // Run ONCE on mount only
+  useEffect(() => {
+    console.log('App: Checking for OAuth callback...');
+    console.log('App: Current URL:', window.location.href);
+    console.log('App: Hash:', window.location.hash);
+    
+    const jwt = parseJwtFromUrl();
+    console.log('App: JWT found:', !!jwt);
+    
+    if (jwt) {
+      console.log('App: Processing OAuth callback JWT...');
+      handleOAuthCallback(jwt).then((result) => {
+        console.log('App: handleOAuthCallback result:', result);
+        if (result) {
+          console.log('App: zkLogin success!', result.email);
+        } else {
+          console.log('App: zkLogin failed - no result');
+        }
+        // Clean URL hash
+        window.history.replaceState({}, '', window.location.pathname + window.location.search);
+      }).catch((err) => {
+        console.error('App: handleOAuthCallback error:', err);
+      });
+    }
+  }, []); // Empty deps - run once on mount
+
+  // Log zkLogin state for debugging
+  useEffect(() => {
+    console.log('App zkLogin state:', { zkLoggedIn, zkUserEmail });
+  }, [zkLoggedIn, zkUserEmail]);
+
+  // Check URL for gift claim parameter
+  useEffect(() => {
+    const urlParams = new URLSearchParams(window.location.search);
+    const giftIdParam = urlParams.get('gift') || urlParams.get('id');
+    
+    if (giftIdParam) {
+      setClaimGiftId(giftIdParam);
+      setCurrentPage('claim');
+      // Clean up URL
+      window.history.replaceState({}, '', window.location.pathname);
+    }
+  }, []);
 
   const handleGiftCreated = (id: string) => {
     setCreatedGiftId(id);
     setCurrentPage('success');
+  };
+
+  // Handle claim gift from notification
+  const handleClaimFromNotification = (giftId: string) => {
+    setClaimGiftId(giftId);
+    setCurrentPage('claim');
+  };
+
+  // Handle popup close
+  const handlePopupClose = () => {
+    if (showPopup) {
+      markAsRead(showPopup.id);
+    }
+    setShowPopup(null);
   };
 
   const pageVariants = {
@@ -70,7 +145,13 @@ function App() {
             exit="exit"
             transition={pageTransition}
           >
-            <ClaimGift onBack={() => setCurrentPage('home')} />
+            <ClaimGift 
+              onBack={() => {
+                setCurrentPage('home');
+                setClaimGiftId(undefined);
+              }} 
+              initialGiftId={claimGiftId}
+            />
           </motion.div>
         );
       case 'success':
@@ -283,6 +364,22 @@ function App() {
       <AnimatePresence mode="wait">
         {renderPage()}
       </AnimatePresence>
+      
+      {/* Notification Toast - Shows bell icon and notification list */}
+      {currentAccount && (
+        <NotificationToast onClaimGift={handleClaimFromNotification} />
+      )}
+      
+      {/* Gift Popup - Shows when clicking on a gift notification */}
+      {showPopup && (
+        <GiftPopup 
+          notification={showPopup}
+          onClose={handlePopupClose}
+          onSuccess={() => {
+            handlePopupClose();
+          }}
+        />
+      )}
       
       {/* Floating Test Data Button */}
       <motion.button

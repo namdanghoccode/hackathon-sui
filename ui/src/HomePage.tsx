@@ -1,7 +1,9 @@
 import { ConnectButton, useCurrentAccount } from "@mysten/dapp-kit";
 import { Box, Button, Container, Flex, Heading, Text } from "@radix-ui/themes";
 import { motion } from "framer-motion";
-import { Gift, Sparkles, Zap, Shield, Users, TrendingUp, Github, Twitter, Mail } from "lucide-react";
+import { Gift, Sparkles, Zap, Shield, Users, TrendingUp, Github, Twitter, Mail, CheckCircle } from "lucide-react";
+import { ZkLoginButton } from "./components/ZkLoginButton";
+import { useZkLogin } from "./hooks/useZkLogin";
 
 interface HomePageProps {
   onNavigate: (page: 'create' | 'claim') => void;
@@ -9,6 +11,7 @@ interface HomePageProps {
 
 export function HomePage({ onNavigate }: HomePageProps) {
   const currentAccount = useCurrentAccount();
+  const { isLoggedIn: zkLoggedIn, userEmail: zkUserEmail, logout: zkLogout } = useZkLogin();
 
   return (
     <Box style={{ 
@@ -127,6 +130,77 @@ export function HomePage({ onNavigate }: HomePageProps) {
           <ConnectButton />
         </Flex>
       </Flex>
+
+      {/* Floating zkLogin Button - Góc phải trên, dưới navbar */}
+      <motion.div
+        initial={{ opacity: 0, x: 30, scale: 0.9 }}
+        animate={{ opacity: 1, x: 0, scale: 1 }}
+        transition={{ duration: 0.6, delay: 0.4, type: "spring" }}
+        style={{
+          position: "fixed",
+          top: "120px",
+          right: "25px",
+          zIndex: 99,
+        }}
+      >
+        {!zkLoggedIn ? (
+          <motion.div
+            animate={{ 
+              boxShadow: [
+                "0 8px 40px rgba(66, 133, 244, 0.3)",
+                "0 12px 50px rgba(66, 133, 244, 0.5)",
+                "0 8px 40px rgba(66, 133, 244, 0.3)",
+              ]
+            }}
+            transition={{ duration: 2, repeat: Infinity, ease: "easeInOut" }}
+            style={{
+              background: "linear-gradient(135deg, #ffffff 0%, #f0f7ff 100%)",
+              padding: "1rem 1.2rem",
+              borderRadius: "15px",
+              border: "2px solid rgba(66, 133, 244, 0.4)",
+            }}
+          >
+            <ZkLoginButton />
+          </motion.div>
+        ) : (
+          <motion.div
+            initial={{ scale: 0.9 }}
+            animate={{ scale: 1 }}
+            style={{
+              background: "linear-gradient(135deg, #ffffff 0%, #f0fff0 100%)",
+              padding: "1rem 1.2rem",
+              borderRadius: "15px",
+              boxShadow: "0 10px 40px rgba(52, 168, 83, 0.3)",
+              border: "2px solid rgba(52, 168, 83, 0.4)",
+            }}
+          >
+            <Flex direction="column" gap="2" align="center">
+              <Flex align="center" gap="2">
+                <CheckCircle size={20} color="#34a853" />
+                <Text size="2" weight="bold" style={{ color: "#34a853" }}>
+                  Đã đăng nhập
+                </Text>
+              </Flex>
+              <Text size="1" style={{ color: "#666", maxWidth: "180px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {zkUserEmail}
+              </Text>
+              <Button
+                size="1"
+                variant="soft"
+                onClick={zkLogout}
+                style={{ 
+                  color: "#666", 
+                  cursor: "pointer", 
+                  fontSize: "12px",
+                  marginTop: "0.3rem",
+                }}
+              >
+                Đăng xuất
+              </Button>
+            </Flex>
+          </motion.div>
+        )}
+      </motion.div>
 
       {/* Hero Section */}
       <Container size="4">
