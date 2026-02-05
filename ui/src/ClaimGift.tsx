@@ -56,7 +56,6 @@ export function ClaimGift({ onBack, initialGiftId }: ClaimGiftProps) {
   const { 
     isLoggedIn: zkLoggedIn, 
     userEmail: zkUserEmail,
-    userAddress: zkUserAddress,
   } = useZkLogin();
   
   const [emailVerified, setEmailVerified] = useState(false);
